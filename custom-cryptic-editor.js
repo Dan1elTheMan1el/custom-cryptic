@@ -5,18 +5,21 @@
 
   const today = new Date();
   const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-  const DEFAULT_DATE = `${today.getDate()} ${months[today.getMonth()]}, ${today.getFullYear()}`;
+  function formatDisplayDate(date) {
+    return `${date.getDate()} ${months[date.getMonth()]}, ${date.getFullYear()}`;
+  }
+  const DEFAULT_DATE = formatDisplayDate(today);
   const DEFAULT_AUTHOR = "Template puzzle";
   const DEFAULT_CLUE = "Hidden starter for a custom link?";
   const DEFAULT_ANSWER = "WORD";
+  // Set this to your Cloudflare Worker URL (e.g. "https://my-cryptic.worker.workers.dev").
+  // You can also override at runtime by setting `window.CUSTOM_CRYPTIC_WORKER_HOST`.
+  const WORKER_HOST = window.CUSTOM_CRYPTIC_WORKER_HOST || "https://custom-cryptic.friedmandaniel111.workers.dev";
+  const SHARE_RETENTION_DAYS = 365; // 0x0.st's stated maximum retention
 
   const params = new URLSearchParams(window.location.search);
-  const sharedPayload = decodeSharedPayload(params.get("c"));
-  const mode = sharedPayload ? "play" : "create";
-
-  const state = mode === "play"
-    ? normalizePayload(sharedPayload)
-    : createDraftFromParams(params);
+  const fileId = params.get("p");
+  const legacyPayload = fileId ? null : decodeSharedPayload(params.get("c"));
 
   const shell = document.createElement("section");
   shell.id = "custom-cryptic-editor-shell";
@@ -26,10 +29,29 @@
   document.body.style.margin = "0";
   document.body.appendChild(shell);
 
-  if (mode === "play") {
-    renderPlayMode(shell, state);
+  if (fileId) {
+    renderLoadingState(shell);
+    (async () => {
+      try {
+        const payload = await fetchSharedPayloadById(fileId);
+        console.log('Loaded puzzle payload:', payload);
+        // Replace loading UI with the worker-provided styles, then render
+        shell.innerHTML = buildStyles();
+        renderPlayMode(shell, normalizePayload(payload));
+      } catch (err) {
+        console.error('Failed to load puzzle:', err);
+        renderLoadError(shell);
+        // If possible, show a short error message in the UI
+        try {
+          const label = shell.querySelector('.label');
+          if (label) label.textContent = "Couldn't load this puzzle.";
+        } catch (e) { }
+      }
+    })();
+  } else if (legacyPayload) {
+    renderPlayMode(shell, normalizePayload(legacyPayload));
   } else {
-    renderCreateMode(shell, state);
+    renderCreateMode(shell, createDraftFromParams(params));
   }
 
   function createDraftFromParams(searchParams) {
@@ -55,16 +77,17 @@
     const answer = normalizeAnswer(payload?.answer || DEFAULT_ANSWER);
     const hints = Array.isArray(payload?.hints) && payload.hints.length
       ? payload.hints.map((hint) => ({
-          id: hint.id || makeId(),
-          text: String(hint.text || ""),
-          type: ["indicator", "fodder", "definition"].includes(hint.type) ? hint.type : "indicator",
-          words: Array.isArray(hint.words) ? hint.words.map(Number).filter(Number.isInteger) : [],
-        }))
+        id: hint.id || makeId(),
+        text: String(hint.text || ""),
+        type: ["indicator", "fodder", "definition"].includes(hint.type) ? hint.type : "indicator",
+        words: Array.isArray(hint.words) ? hint.words.map(Number).filter(Number.isInteger) : [],
+      }))
       : [{ id: makeId(), text: "", type: "indicator", words: [] }];
 
     return {
       mode: "play",
       date: payload?.date || DEFAULT_DATE,
+      expiresAt: payload?.expiresAt && !Number.isNaN(Date.parse(payload.expiresAt)) ? payload.expiresAt : null,
       author: payload?.author || DEFAULT_AUTHOR,
       clue,
       answer,
@@ -139,6 +162,11 @@
 
         #custom-cryptic-editor-shell .date {
           font: 700 20px/1.1 "SF Pro Display", "SF Pro Text", sans-serif;
+        }
+
+        #custom-cryptic-editor-shell .expiry-date {
+          font: 600 13px/1.2 "SF Pro Text", "Segoe UI", sans-serif;
+          color: rgba(17, 17, 17, 0.6);
         }
 
         #custom-cryptic-editor-shell .author-row {
@@ -742,7 +770,7 @@
                 <div class="stat-row"><span>Target par</span><strong id="stat-target">${draft.par}</strong></div>
               </div>
               <div class="share-url-wrap" style="margin-top: 14px;">
-                <div class="share-url" id="share-url" style="display:block;padding:14px;border-radius:16px;background:#111111;color:#f8f4e8;overflow:auto;font:500 13px/1.5 SFMono-Regular,Consolas,\"Liberation Mono\",Menlo,monospace;white-space:pre-wrap;word-break:break-word;"></div>
+                <div class="share-url" id="share-url" style="display:block;padding:14px;border-radius:16px;background:#111111;color:#f8f4e8;overflow:auto;font:500 13px/1.5 SFMono-Regular,Consolas,\"Liberation Mono\",Menlo,monospace;white-space:pre-wrap;word-break:break-word;">Click Share to generate a link</div>
                 <button class="share-button" id="share-button" type="button" style="margin-top:12px;">Share</button>
               </div>
               <div class="legend">
@@ -778,14 +806,13 @@
       answerLengthPill.textContent = `${countAnswerLetters(draft.answer)} letters`;
       statLetters.textContent = String(countAnswerLetters(draft.answer));
       statHints.textContent = String(draft.hints.length);
-      
+
       const maxPar = Math.max(countAnswerLetters(draft.answer) + draft.hints.length, 1);
       if (draft.par > maxPar) {
         draft.par = maxPar;
       }
-      
+
       statTarget.textContent = String(draft.par);
-      shareUrlEl.textContent = buildShareUrl(draft);
       renderAnswerTiles(root, draft, answerTiles, true);
       renderParCircles(root, draft, parCircles, createParLabel);
       renderHintEditorList(root, draft, hintList, () => render());
@@ -806,7 +833,7 @@
       draft.selectedAnswerIndex = Math.max(countAnswerLetters(draft.answer) - 1, 0);
       render();
     });
-    
+
     answerTiles.addEventListener("click", (event) => {
       const button = event.target.closest("[data-answer-index]");
       if (!button) {
@@ -822,15 +849,27 @@
     });
 
     shareButton.addEventListener("click", async () => {
-      const shareUrl = buildShareUrl(draft);
+      shareButton.disabled = true;
+      shareButton.textContent = "Uploading…";
+      shareUrlEl.textContent = "Uploading puzzle…";
       try {
-        await navigator.clipboard.writeText(shareUrl);
-        shareButton.textContent = "Copied";
+        const shareUrl = await buildAndUploadShareUrl(draft);
+        shareUrlEl.textContent = shareUrl;
+        try {
+          await navigator.clipboard.writeText(shareUrl);
+          shareButton.textContent = "Copied";
+        } catch (clipboardError) {
+          window.prompt("Copy this link", shareUrl);
+          shareButton.textContent = "Share";
+        }
+      } catch (error) {
+        shareUrlEl.textContent = "Couldn't upload this puzzle. Check your connection and try again.";
+        shareButton.textContent = "Share";
+      } finally {
+        shareButton.disabled = false;
         window.setTimeout(() => {
           shareButton.textContent = "Share";
-        }, 1200);
-      } catch (error) {
-        window.prompt("Copy this link", shareUrl);
+        }, 1500);
       }
     });
 
@@ -843,6 +882,7 @@
         <div class="topbar">
           <div class="topbar-left" style="gap: 3px;">
             <div class="date">${escapeHtml(playState.date)}</div>
+            ${playState.expiresAt ? `<div class="expiry-date">Expires ${escapeHtml(formatDisplayDate(new Date(playState.expiresAt)))}</div>` : ""}
             <div class="author-row"><span class="author-prefix">By</span><span style="font: 600 15px/1.2 'SF Pro Text', 'Segoe UI', sans-serif;">${escapeHtml(playState.author)}</span></div>
           </div>
           <div class="topbar-right">
@@ -910,12 +950,12 @@
       renderMeter(playState, meterDots, meterLabel);
       renderHintMenu(playState, hintMenu, () => render());
       renderStackedHints(playState, stackedHints);
-      
+
       if (playState.solved) {
         hintPanel.classList.remove("open");
         guessButton.disabled = true;
         hintToggle.disabled = true;
-        
+
         const score = playState.par - playState.usedHints.length;
         let scoreText = "";
         if (score > 0) scoreText = `(${score} under par)`;
@@ -956,7 +996,7 @@
       if (playState.solved) return;
       if (event.target.classList.contains("tile")) {
         const index = Number(event.target.getAttribute("data-answer-index"));
-        
+
         if (event.key === "Backspace" && !event.target.value) {
           event.preventDefault();
           let prev = index - 1;
@@ -1003,7 +1043,7 @@
         const hint = playState.hints.find((entry) => entry.id === hintId);
         if (hint) {
           playState.usedHints = [...new Set([...playState.usedHints, hintId])];
-          
+
           hint.words.forEach(wIndex => {
             playState.highlightedWords[wIndex] = hint.type;
           });
@@ -1014,8 +1054,23 @@
     });
 
     guessButton.addEventListener("click", () => {
-      const normalizedGuess = (playState.typedGuess || "").replace(/\s/g, "");
-      const normalizedAnswer = normalizeAnswer(playState.answer).replace(/\s/g, "");
+      const solution = normalizeAnswer(playState.answer).replace(/\s/g, "");
+      const typed = (playState.typedGuess || "").split("");
+      // Ensure typed array has proper length
+      while (typed.length < solution.length) typed.push(" ");
+
+      // Build effective guess by applying revealed letters over typed input
+      const combined = Array.from({ length: solution.length }, (_, idx) => {
+        if (playState.revealedLetters.includes(idx)) {
+          return solution[idx];
+        }
+        const ch = typed[idx] || " ";
+        return ch === " " ? "" : ch;
+      }).join("");
+
+      const normalizedGuess = combined.replace(/\s/g, "");
+      const normalizedAnswer = solution;
+
       if (normalizedGuess === normalizedAnswer && normalizedGuess.length === normalizedAnswer.length) {
         playState.solved = true;
         guessButton.classList.remove("wrong");
@@ -1146,16 +1201,25 @@
 
   function renderAnswerTiles(root, data, container, isCreateMode) {
     const solution = normalizeAnswer(data.answer).replace(/\s/g, "");
-    const guess = isCreateMode ? solution : normalizeAnswer(data.typedGuess || "").replace(/\s/g, "");
     const letters = solution.split("");
+    // typedGuess is stored as an array-like string where each position maps to a letter index
+    let guessArr = [];
+    if (isCreateMode) {
+      guessArr = letters.slice();
+    } else {
+      guessArr = (data.typedGuess || "").split("");
+      while (guessArr.length < letters.length) guessArr.push(" ");
+    }
     const totalLetters = letters.length;
     const isSolved = !isCreateMode && data.solved;
 
     container.innerHTML = letters.map((letter, index) => {
       const revealed = !isCreateMode && data.revealedLetters.includes(index);
       const locked = revealed || isSolved;
-      const shown = isCreateMode ? letter : (guess[index] && guess[index] !== " " ? guess[index] : (revealed ? letter : ""));
-      
+      const shown = isCreateMode
+        ? letter
+        : (guessArr[index] && guessArr[index] !== " " ? guessArr[index] : (revealed ? letter : ""));
+
       if (isCreateMode) {
         const selected = index === data.selectedAnswerIndex ? "selected" : "";
         return `<button type="button" class="tile ${selected}" data-answer-index="${index}" aria-label="Letter ${index + 1} of ${totalLetters}">${escapeHtml(shown)}</button>`;
@@ -1173,7 +1237,7 @@
       const active = index + 1 === data.par ? "active" : "";
       return `<button type="button" class="par-circle ${active}" data-par="${index + 1}" aria-label="Set par to ${index + 1}"></button>`;
     }).join("");
-    
+
     if (label) {
       label.textContent = `par ${data.par}`;
     }
@@ -1213,7 +1277,7 @@
     };
 
     let html = "";
-    
+
     // Display used hints first
     data.usedHints.forEach(hintId => {
       if (String(hintId).startsWith("letter-")) {
@@ -1227,7 +1291,7 @@
         }
       }
     });
-    
+
     // Display any remaining unrevealed hints if solved
     if (data.solved) {
       data.hints.forEach(hint => {
@@ -1237,7 +1301,7 @@
         }
       });
     }
-    
+
     container.innerHTML = html;
   }
 
@@ -1260,10 +1324,10 @@
     container.innerHTML = `
       <button class="hint-choice random" data-action="random-letter" type="button">Reveal random letter</button>
       ${data.hints.map((hint) => {
-        const used = data.usedHints.includes(hint.id);
-        const revealedIndicator = used ? ` (Used)` : "";
-        return `<button class="hint-choice ${hintTone(hint.type)}" data-action="hint" data-hint-id="${hint.id}" type="button">${escapeHtml(labelFor(hint))}${revealedIndicator}</button>`;
-      }).join("")}
+      const used = data.usedHints.includes(hint.id);
+      const revealedIndicator = used ? ` (Used)` : "";
+      return `<button class="hint-choice ${hintTone(hint.type)}" data-action="hint" data-hint-id="${hint.id}" type="button">${escapeHtml(labelFor(hint))}${revealedIndicator}</button>`;
+    }).join("")}
     `;
   }
 
@@ -1288,11 +1352,10 @@
     data.revealedLetters = [...data.revealedLetters, chosenIndex];
     data.usedHints = [...new Set([...data.usedHints, `letter-${chosenIndex}`])];
     data.feedback = ""; // Feedback handled visually via stacking now
-    
-    let guessArr = (data.typedGuess || "").split("");
-    while (guessArr.length < solution.length) guessArr.push(" ");
-    guessArr[chosenIndex] = solution[chosenIndex];
-    data.typedGuess = guessArr.join("");
+
+    // Do NOT modify `typedGuess` here — mark the letter as revealed so it
+    // appears permanently in the UI, but avoid injecting the character into
+    // the user's typed guess or other positions.
   }
 
   function hintTone(type) {
@@ -1341,31 +1404,122 @@
       .map((text) => ({ id: makeId(), text, type: "indicator", words: [] }));
   }
 
-  function buildShareUrl(draft) {
-    const payload = {
+  function buildSharePayload(draft) {
+    const expiresAt = new Date(Date.now() + SHARE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    return {
       date: draft.date,
+      expiresAt,
       author: draft.author,
       clue: draft.clue.trim(),
       answer: draft.answer,
       hints: draft.hints,
       par: draft.par,
     };
+  }
+
+  // Cloudflare Worker-backed storage functions.
+  // The worker exposes:
+  //  - POST /p       -> create puzzle, returns { id }
+  //  - GET  /p/:id    -> fetch puzzle JSON
+  async function uploadSharedPayload(payload) {
+    const url = `${WORKER_HOST.replace(/\/$/, "")}/p`;
+    const bodyText = JSON.stringify(payload);
+    // Client-side safeguard: don't try to upload extremely large payloads
+    const MAX_BODY = 200 * 1024; // 200KB
+    if (bodyText.length > MAX_BODY) {
+      throw new Error("Payload too large");
+    }
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: bodyText,
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`Upload failed (${response.status}) ${text}`);
+    }
+
+    const data = await response.json();
+    if (!data || !data.id) throw new Error("Unexpected response from worker");
+    return data.id;
+  }
+
+  async function buildAndUploadShareUrl(draft) {
+    const fileId = await uploadSharedPayload(buildSharePayload(draft));
     const url = new URL(window.location.href);
-    url.search = `?c=${encodeSharedPayload(payload)}`;
+    url.search = `?p=${encodeURIComponent(fileId)}`;
     url.hash = "";
     return url.toString();
   }
 
-  function encodeSharedPayload(payload) {
-    const json = JSON.stringify(payload);
-    const bytes = new TextEncoder().encode(json);
-    let binary = "";
-    bytes.forEach((byte) => {
-      binary += String.fromCharCode(byte);
-    });
-    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  async function fetchSharedPayloadById(fileId) {
+    const url = `${WORKER_HOST.replace(/\/$/, "")}/p/${encodeURIComponent(fileId)}`;
+    const controller = new AbortController();
+    const timeoutMs = 15000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    let response;
+    try {
+      response = await fetch(url, { method: "GET", signal: controller.signal });
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        throw new Error('Request timed out');
+      }
+      throw new Error('Network error while fetching puzzle');
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`Fetch failed (${response.status}) ${text}`);
+    }
+
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('application/json')) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`Unexpected response content-type: ${contentType} ${text}`);
+    }
+
+    try {
+      return await response.json();
+    } catch (err) {
+      throw new Error('Failed to parse puzzle JSON');
+    }
   }
 
+  function renderLoadingState(root) {
+    root.innerHTML += `
+      <div class="page">
+        <div class="content">
+          <section class="card clue-card" style="text-align:center;padding:60px 28px;">
+            <div class="label">Loading puzzle…</div>
+          </section>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderLoadError(root) {
+    root.innerHTML = buildStyles();
+    root.innerHTML += `
+      <div class="page">
+        <div class="content">
+          <section class="card clue-card" style="text-align:center;padding:60px 28px;">
+            <div class="label" style="margin-bottom:12px;">Couldn't load this puzzle</div>
+            <div style="font:600 15px/1.5 'SF Pro Text','Segoe UI',sans-serif;color:rgba(17,17,17,0.7);margin-bottom:20px;">
+              The link may have expired, been mistyped, or your browser may be blocking the request.
+            </div>
+            <a href="${window.location.origin}${window.location.pathname}" style="display:inline-block;border:3px solid #111111;border-radius:999px;padding:10px 20px;font:700 15px/1.2 'SF Pro Text','Segoe UI',sans-serif;text-decoration:none;color:#111111;">Start a new puzzle</a>
+          </section>
+        </div>
+      </div>
+    `;
+  }
+
+  // Legacy format (?c=<base64 JSON>) — kept so previously shared links still open.
   function decodeSharedPayload(value) {
     if (!value) {
       return null;
@@ -1373,11 +1527,11 @@
 
     try {
       let base64 = value.replace(/-/g, "+").replace(/_/g, "/");
-      
+
       while (base64.length % 4 !== 0) {
         base64 += "=";
       }
-      
+
       const binary = atob(base64);
       const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
       return JSON.parse(new TextDecoder().decode(bytes));
