@@ -4,8 +4,9 @@ Cloudflare Worker to store puzzles in a KV namespace named `PUZZLES`.
 Bindings required in Cloudflare dashboard (or wrangler):
 - A KV Namespace bound to `PUZZLES`.
 
-Optional environment variable binding (as a Worker Secret or plain env):
+Optional environment variable bindings (as a Worker Secret or plain env):
 - WRITE_SECRET (string) - if set, POST requests must include header `x-write-secret: <value>`
+- WEBHOOK_URL (string) - if set, successful puzzle publication sends a Discord webhook notification
 
 Features & abuse protections:
 - Validates payload schema and max lengths
@@ -16,7 +17,7 @@ Features & abuse protections:
 */
 
 addEventListener('fetch', (event) => {
-    event.respondWith(handleRequest(event.request));
+    event.respondWith(handleRequest(event.request, event));
 });
 
 // Configuration
@@ -49,7 +50,7 @@ function textResponse(text, status = 200, extraHeaders = {}) {
     });
 }
 
-async function handleRequest(request) {
+async function handleRequest(request, event) {
     if (request.method === 'OPTIONS') {
         return new Response(null, { headers: CORS_HEADERS });
     }
@@ -115,7 +116,7 @@ async function handleRequest(request) {
             // Rate-limit per IP per day (simple counter stored in KV with 24h TTL)
             const ip = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'anon';
             const dayKey = `ip:${ip}:${(new Date()).toISOString().slice(0, 10)}`; // YYYY-MM-DD
-            const ipCountRaw = await PUZZLES.get(dayKey);
+            const ipCountRaw = await globalThis.PUZZLES.get(dayKey);
             const ipCount = ipCountRaw ? Number(ipCountRaw) : 0;
             if (ipCount >= MAX_UPLOADS_PER_IP_PER_DAY) {
                 return jsonResponse({ error: 'Upload quota exceeded for this IP today' }, 429);
@@ -140,6 +141,15 @@ async function handleRequest(request) {
 
             await globalThis.PUZZLES.put(id, JSON.stringify(storedPayload), { expirationTtl: ttlSeconds });
 
+            if (globalThis.WEBHOOK_URL) {
+                const notification = sendDiscordPublicationNotification(request, id, storedPayload);
+                if (event && typeof event.waitUntil === 'function') {
+                    event.waitUntil(notification);
+                } else {
+                    await notification;
+                }
+            }
+
             // increment ip counter
             const newCount = ipCount + 1;
             // store with 24h TTL
@@ -161,4 +171,77 @@ function generateId(length = 10) {
     let s = '';
     for (let i = 0; i < length; i++) s += alphabet[Math.floor(Math.random() * alphabet.length)];
     return s;
+}
+
+function sendDiscordPublicationNotification(request, id, puzzle) {
+    const webhookUrl = globalThis.WEBHOOK_URL;
+    if (!webhookUrl) {
+        return Promise.resolve();
+    }
+
+    const puzzleUrl = "https://dan1eltheman1el.github.io/custom-cryptic/?p=" + encodeURIComponent(id);
+    const hintCounts = countHintsByType(puzzle.hints || []);
+    const letterCount = countAnswerLetters(puzzle.answer);
+
+    return fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            allowed_mentions: { parse: [] },
+            embeds: [{
+                title: 'New Puzzle Published!',
+                url: puzzleUrl,
+                color: 0xadd3ff,
+                description: '**Clue:**\n' + truncateForDiscord(puzzle.clue || '', 1024),
+                author: { name: truncateForDiscord(puzzle.author || 'Anonymous', 1024) },
+                timestamp: new Date().toISOString(),
+                fields: [
+                    { name: 'Letters', value: String(letterCount), inline: true },
+                    { name: 'Par', value: String(Number.isInteger(puzzle.par) ? puzzle.par : 0), inline: true },
+                    { name: 'Hint types', value: truncateForDiscord(formatHintCounts(hintCounts), 1024), inline: false }
+                ],
+            }],
+        }),
+    }).then((response) => {
+        if (!response.ok) {
+            throw new Error(`Discord webhook failed with ${response.status}`);
+        }
+    }).catch((err) => {
+        console.warn('Discord publication notification failed', err);
+    });
+}
+
+function countAnswerLetters(value) {
+    return String(value || '')
+        .toUpperCase()
+        .replace(/[^A-Z ]/g, '')
+        .replace(/\s/g, '')
+        .length;
+}
+
+function countHintsByType(hints) {
+    return (Array.isArray(hints) ? hints : []).reduce((counts, hint) => {
+        const type = normalizeHintType(hint && hint.type);
+        counts[type] += 1;
+        return counts;
+    }, { indicator: 0, fodder: 0, definition: 0 });
+}
+
+function normalizeHintType(type) {
+    return ['indicator', 'fodder', 'definition'].includes(type) ? type : 'indicator';
+}
+
+function formatHintCounts(counts) {
+    return ['indicator', 'fodder', 'definition']
+        .map((type) => `${type}: ${counts[type] || 0}`)
+        .join(', ');
+}
+
+function truncateForDiscord(value, maxLength = 1024) {
+    const text = String(value == null ? '' : value);
+    if (text.length <= maxLength) {
+        return text;
+    }
+
+    return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
 }
