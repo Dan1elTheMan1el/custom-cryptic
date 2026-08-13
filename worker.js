@@ -4,8 +4,7 @@ Cloudflare Worker to store puzzles in a KV namespace named `PUZZLES`.
 Bindings required in Cloudflare dashboard (or wrangler):
 - A KV Namespace bound to `PUZZLES`.
 
-Optional environment variable bindings (as a Worker Secret or plain env):
-- WRITE_SECRET (string) - if set, POST requests must include header `x-write-secret: <value>`
+Optional environment variable bindings (as plain env):
 - WEBHOOK_URL (string) - if set, successful puzzle publication sends a Discord webhook notification
 
 Features & abuse protections:
@@ -13,7 +12,7 @@ Features & abuse protections:
 - Rejects payloads containing HTML tags / script-like tags
 - Per-IP daily upload cap using the same KV namespace with `ip:` prefix (stored with 24h TTL)
 - Max body size enforced (200KB)
-- Stored items get an expiration TTL (in seconds) derived from payload.expiresAt or capped to 365 days
+- Stored items get an expiration TTL capped to 365 days
 */
 
 addEventListener('fetch', (event) => {
@@ -32,8 +31,8 @@ const DEFAULT_RETENTION_DAYS = 365;
 // Allow CORS from anywhere by default; you can change this to restrict origins.
 const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, x-edit-key',
 };
 
 function jsonResponse(body, status = 200, extraHeaders = {}) {
@@ -62,13 +61,13 @@ async function handleRequest(request, event) {
         if (request.method === 'GET' && parts[0] === 'p' && parts[1]) {
             // GET /p/:id
             const id = parts[1];
-            const stored = await globalThis.PUZZLES.get(id);
+            const stored = await loadPuzzleRecord(id);
             if (!stored) return jsonResponse({ error: 'Not found' }, 404);
-            // Return stored JSON as-is
-            return new Response(stored, { status: 200, headers: Object.assign({ 'Content-Type': 'application/json' }, CORS_HEADERS) });
+            const parsed = JSON.parse(stored);
+            return jsonResponse(stripStorageFields(parsed));
         }
 
-        if (request.method === 'POST' && parts[0] === 'p') {
+        if ((request.method === 'POST' || request.method === 'PUT') && parts[0] === 'p') {
 
             // Read body text to enforce size limit
             const bodyText = await request.text();
@@ -89,6 +88,9 @@ async function handleRequest(request, event) {
             const author = payload.author == null ? '' : String(payload.author).trim();
             const hints = Array.isArray(payload.hints) ? payload.hints : [];
 
+            if (!author) {
+                return jsonResponse({ error: 'Author is required' }, 400);
+            }
             if (!answer || answer.length > MAX_ANSWER_LENGTH) {
                 return jsonResponse({ error: 'Answer missing or too long' }, 400);
             }
@@ -122,13 +124,21 @@ async function handleRequest(request, event) {
                 return jsonResponse({ error: 'Upload quota exceeded for this IP today' }, 429);
             }
 
-            // All checks passed — store the puzzle
-            const id = generateId();
+            const isUpdate = request.method === 'PUT';
+            const id = isUpdate ? parts[1] : generateId();
+            const existing = isUpdate ? await loadPuzzleRecord(id) : null;
+            const existingRecord = existing ? JSON.parse(existing) : null;
 
-            // TTL: always use default retention (no expiresAt handling)
+            if (isUpdate) {
+                const providedEditKey = String(payload.editKey || request.headers.get('x-edit-key') || '');
+                if (!existingRecord || !existingRecord.editKey || providedEditKey !== existingRecord.editKey) {
+                    return jsonResponse({ error: 'Unauthorized edit' }, 401);
+                }
+            }
+
+            const editKey = isUpdate && existingRecord && existingRecord.editKey ? existingRecord.editKey : generateId(16);
+
             const ttlSeconds = DEFAULT_RETENTION_DAYS * 24 * 60 * 60;
-
-            // canonicalize a little: only keep expected keys
 
             const storedPayload = {
                 date: payload.date || new Date().toISOString(),
@@ -137,11 +147,14 @@ async function handleRequest(request, event) {
                 answer,
                 hints: hints.map(h => ({ id: h.id || null, text: String(h.text || ''), type: (h && h.type) || 'indicator', words: Array.isArray(h && h.words) ? h.words.map(Number).filter(Number.isInteger) : [] })),
                 par: Number.isInteger(payload.par) ? payload.par : 0,
+                editKey,
+                updatedAt: new Date().toISOString(),
             };
 
-            await globalThis.PUZZLES.put(id, JSON.stringify(storedPayload), { expirationTtl: ttlSeconds });
+            await globalThis.PUZZLES.put(recordKey(id), JSON.stringify(storedPayload), { expirationTtl: ttlSeconds });
+            await globalThis.PUZZLES.put(editRecordKey(editKey), id, { expirationTtl: ttlSeconds });
 
-            if (globalThis.WEBHOOK_URL) {
+            if (globalThis.WEBHOOK_URL && !isUpdate) {
                 const notification = sendDiscordPublicationNotification(request, id, storedPayload);
                 if (event && typeof event.waitUntil === 'function') {
                     event.waitUntil(notification);
@@ -155,7 +168,7 @@ async function handleRequest(request, event) {
             // store with 24h TTL
             await globalThis.PUZZLES.put(dayKey, String(newCount), { expirationTtl: 24 * 60 * 60 });
 
-            return jsonResponse({ id }, 201);
+            return jsonResponse({ id, editKey }, isUpdate ? 200 : 201);
         }
 
         return jsonResponse({ error: 'Not found' }, 404);
@@ -163,6 +176,34 @@ async function handleRequest(request, event) {
         // avoid leaking internal error details
         return jsonResponse({ error: 'Server error' }, 500);
     }
+}
+
+function recordKey(id) {
+    return `puzzle:${id}`;
+}
+
+function editRecordKey(editKey) {
+    return `edit:${editKey}`;
+}
+
+async function loadPuzzleRecord(id) {
+    const modern = await globalThis.PUZZLES.get(recordKey(id));
+    if (modern) {
+        return modern;
+    }
+
+    return globalThis.PUZZLES.get(id);
+}
+
+function stripStorageFields(payload) {
+    return {
+        date: payload.date,
+        author: payload.author,
+        clue: payload.clue,
+        answer: payload.answer,
+        hints: payload.hints,
+        par: payload.par,
+    };
 }
 
 function generateId(length = 10) {

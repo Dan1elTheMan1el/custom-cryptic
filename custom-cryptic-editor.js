@@ -9,13 +9,14 @@
     return `${date.getDate()} ${months[date.getMonth()]}, ${date.getFullYear()}`;
   }
   const DEFAULT_DATE = formatDisplayDate(today);
-  const DEFAULT_AUTHOR = "Template puzzle";
+  const DEFAULT_AUTHOR = "";
   const DEFAULT_CLUE = "Hidden starter for a custom link?";
   const DEFAULT_ANSWER = "WORD";
   // Set this to your Cloudflare Worker URL (e.g. "https://my-cryptic.worker.workers.dev").
   // You can also override at runtime by setting `window.CUSTOM_CRYPTIC_WORKER_HOST`.
   const WORKER_HOST = window.CUSTOM_CRYPTIC_WORKER_HOST || "https://custom-cryptic.friedmandaniel111.workers.dev";
   const SHARE_RETENTION_DAYS = 365; // 0x0.st's stated maximum retention
+  const STORAGE_KEY = "custom-cryptic-drafts";
 
   const params = new URLSearchParams(window.location.search);
   const fileId = params.get("p");
@@ -69,6 +70,8 @@
       selectedHintId: null,
       par: Math.max(countAnswerLetters(answer) + hints.length, 1),
       activeHintMenu: false,
+      shareId: null,
+      editKey: null,
     };
   }
 
@@ -87,7 +90,6 @@
     return {
       mode: "play",
       date: payload?.date || DEFAULT_DATE,
-      expiresAt: payload?.expiresAt && !Number.isNaN(Date.parse(payload.expiresAt)) ? payload.expiresAt : null,
       author: payload?.author || DEFAULT_AUTHOR,
       clue,
       answer,
@@ -100,6 +102,7 @@
       solved: false, // Tracks the win state
       hintPanelOpen: false,
       highlightedWords: {},
+      clueWordLengths: getAnswerWordLengths(answer),
       par: Number.isInteger(payload?.par) && payload.par > 0
         ? payload.par
         : Math.max(countAnswerLetters(answer) + hints.length, 1),
@@ -288,6 +291,13 @@
           width: 100%;
         }
 
+        #custom-cryptic-editor-shell .clue-lengths {
+          margin-left: 10px;
+          font: 700 clamp(1.4rem, 2vw, 2.1rem)/1.1 "SF Pro Text", "Segoe UI", sans-serif;
+          color: rgba(17, 17, 17, 0.5);
+          white-space: nowrap;
+        }
+
         #custom-cryptic-editor-shell .highlighted-word {
           padding: 0 6px;
           border-radius: 10px;
@@ -305,8 +315,18 @@
           display: flex;
           flex-wrap: wrap;
           justify-content: center;
-          gap: 0; /* Remove gap to connect boxes */
+          gap: 0;
           padding: 4px 0 18px;
+        }
+
+        #custom-cryptic-editor-shell .answer-group {
+          display: inline-flex;
+          align-items: stretch;
+        }
+
+        #custom-cryptic-editor-shell .answer-gap {
+          width: 14px;
+          flex: 0 0 14px;
         }
 
         #custom-cryptic-editor-shell .tile {
@@ -716,7 +736,7 @@
             <div class="date">${escapeHtml(draft.date)}</div>
             <div class="author-row">
               <span class="author-prefix">By</span>
-              <input id="author-input" class="author-input" value="${escapeHtml(draft.author)}" aria-label="Author name">
+              <input id="author-input" class="author-input" value="${escapeHtml(draft.author)}" aria-label="Author name" placeholder="Your name" required>
             </div>
           </div>
           <div class="topbar-right">
@@ -735,7 +755,7 @@
             </div>
             <div class="clue-input-wrap">
               <textarea id="clue-input" class="clue-input" aria-label="Clue text">${escapeHtml(draft.clue)}</textarea>
-              <div class="clue-count-suffix" id="clue-length-pill" aria-hidden="true">(${countAnswerLetters(draft.answer)})</div>
+              <div class="clue-count-suffix" id="clue-length-pill" aria-hidden="true"></div>
             </div>
           </section>
 
@@ -801,7 +821,8 @@
     const statTarget = root.querySelector("#stat-target");
 
     const render = () => {
-      clueLengthPill.textContent = `(${countAnswerLetters(draft.answer)})`;
+      const answerLengths = getWordLengths(draft.answer);
+      clueLengthPill.textContent = answerLengths.length ? `(${answerLengths.join(", ")})` : "";
       answerInput.value = draft.answer;
       answerLengthPill.textContent = `${countAnswerLetters(draft.answer)} letters`;
       statLetters.textContent = String(countAnswerLetters(draft.answer));
@@ -816,10 +837,15 @@
       renderAnswerTiles(root, draft, answerTiles, true);
       renderParCircles(root, draft, parCircles, createParLabel);
       renderHintEditorList(root, draft, hintList, () => render());
+
+      const hasAuthor = Boolean(String(draft.author || "").trim());
+      shareButton.disabled = !hasAuthor;
+      shareButton.textContent = hasAuthor ? (draft.shareId ? "Update" : "Share") : "Enter author";
     };
 
     authorInput.addEventListener("input", (event) => {
       draft.author = event.target.value;
+      render();
     });
 
     clueInput.addEventListener("input", (event) => {
@@ -849,6 +875,11 @@
     });
 
     shareButton.addEventListener("click", async () => {
+      if (!String(draft.author || "").trim()) {
+        shareUrlEl.textContent = "Enter an author name before sharing.";
+        return;
+      }
+
       shareButton.disabled = true;
       shareButton.textContent = "Uploading…";
       shareUrlEl.textContent = "Uploading puzzle…";
@@ -864,11 +895,10 @@
         }
       } catch (error) {
         shareUrlEl.textContent = "Couldn't upload this puzzle. Check your connection and try again.";
-        shareButton.textContent = "Share";
       } finally {
         shareButton.disabled = false;
         window.setTimeout(() => {
-          shareButton.textContent = "Share";
+          shareButton.textContent = String(draft.author || "").trim() ? (draft.shareId ? "Update" : "Share") : "Enter author";
         }, 1500);
       }
     });
@@ -882,10 +912,10 @@
         <div class="topbar">
           <div class="topbar-left" style="gap: 3px;">
             <div class="date">${escapeHtml(playState.date)}</div>
-            ${playState.expiresAt ? `<div class="expiry-date">Expires ${escapeHtml(formatDisplayDate(new Date(playState.expiresAt)))}</div>` : ""}
             <div class="author-row"><span class="author-prefix">By</span><span style="font: 600 15px/1.2 'SF Pro Text', 'Segoe UI', sans-serif;">${escapeHtml(playState.author)}</span></div>
           </div>
           <div class="topbar-right">
+            <a class="github-link" href="https://dan1eltheman1el.github.io/custom-cryptic" rel="noreferrer" aria-label="Create your own puzzle" title="Create your own puzzle" style="width: 58px; height: 58px; margin-right: 8px; background: #fff2a8; text-decoration: none; font: 700 12px/1.1 'SF Pro Text', 'Segoe UI', sans-serif; text-align: center; padding: 8px; display: inline-flex; align-items: center; justify-content: center;">Create</a>
             <a class="github-link" href="https://github.com/Dan1elTheMan1el" target="_blank" rel="noreferrer" aria-label="GitHub profile">
               <svg width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M12 2C6.48 2 2 6.58 2 12.25C2 16.78 4.865 20.61 8.84 21.97C9.34 22.06 9.52 21.75 9.52 21.49C9.52 21.26 9.51 20.54 9.51 19.69C6.73 20.31 6.14 18.47 6.14 18.47C5.69 17.28 5.04 16.97 5.04 16.97C4.13 16.33 5.11 16.34 5.11 16.34C6.12 16.42 6.65 17.41 6.65 17.41C7.54 18.98 8.99 18.53 9.57 18.28C9.66 17.62 9.92 17.17 10.21 16.92C7.99 16.66 5.66 15.77 5.66 11.84C5.66 10.72 6.05 9.81 6.7 9.1C6.59 8.84 6.24 7.82 6.8 6.44C6.8 6.44 7.63 6.17 9.5 7.48C10.28 7.26 11.11 7.15 11.94 7.15C12.77 7.15 13.6 7.26 14.38 7.48C16.25 6.17 17.08 6.44 17.08 6.44C17.64 7.82 17.29 8.84 17.18 9.1C17.84 9.81 18.22 10.72 18.22 11.84C18.22 15.79 15.88 16.65 13.65 16.91C14.01 17.22 14.34 17.83 14.34 18.76C14.34 20.1 14.33 21.18 14.33 21.49C14.33 21.75 14.51 22.07 15.02 21.97C18.99 20.61 21.85 16.78 21.85 12.25C21.85 6.58 17.52 2 12 2Z" fill="currentColor"></path>
@@ -945,7 +975,7 @@
 
     const clueWords = tokenizeClue(playState.clue);
     const render = () => {
-      playClue.innerHTML = renderPreviewClue(playState.clue, clueWords, playState.highlightedWords);
+      playClue.innerHTML = renderPreviewClue(playState.clue, clueWords, playState.highlightedWords, playState.clueWordLengths);
       renderAnswerTiles(root, playState, playAnswerTiles, false);
       renderMeter(playState, meterDots, meterLabel);
       renderHintMenu(playState, hintMenu, () => render());
@@ -1190,18 +1220,20 @@
     });
   }
 
-  function renderPreviewClue(clue, words, highlightedWords) {
+  function renderPreviewClue(clue, words, highlightedWords, lengths) {
     const tokens = tokenizeClue(clue);
     const clueText = tokens.map((word, index) => {
       const tone = highlightedWords[index];
       return `<span class="${tone ? `highlighted-word ${tone}` : ""}">${escapeHtml(word)}</span>`;
     }).join(" ");
-    return `<span class="clue-text-wrap">${clueText}</span>`;
+    const lengthText = Array.isArray(lengths) && lengths.length ? ` <span class="clue-lengths">(${escapeHtml(lengths.join(", "))})</span>` : "";
+    return `<span class="clue-text-wrap">${clueText}${lengthText}</span>`;
   }
 
   function renderAnswerTiles(root, data, container, isCreateMode) {
-    const solution = normalizeAnswer(data.answer).replace(/\s/g, "");
-    const letters = solution.split("");
+    const normalized = normalizeAnswer(data.answer).trim();
+    const groups = normalized ? normalized.split(/\s+/).filter(Boolean) : [""];
+    const letters = groups.join("").split("");
     // typedGuess is stored as an array-like string where each position maps to a letter index
     let guessArr = [];
     if (isCreateMode) {
@@ -1213,22 +1245,29 @@
     const totalLetters = letters.length;
     const isSolved = !isCreateMode && data.solved;
 
-    container.innerHTML = letters.map((letter, index) => {
-      const revealed = !isCreateMode && data.revealedLetters.includes(index);
-      const locked = revealed || isSolved;
-      const shown = isCreateMode
-        ? letter
-        : (guessArr[index] && guessArr[index] !== " " ? guessArr[index] : (revealed ? letter : ""));
+    let letterIndex = 0;
+    const groupHtml = groups.map((group, groupIndex) => {
+      const tiles = group.split("").map((letter) => {
+        const index = letterIndex++;
+        const revealed = !isCreateMode && data.revealedLetters.includes(index);
+        const locked = revealed || isSolved;
+        const shown = isCreateMode
+          ? letter
+          : (guessArr[index] && guessArr[index] !== " " ? guessArr[index] : (revealed ? letter : ""));
 
-      if (isCreateMode) {
-        const selected = index === data.selectedAnswerIndex ? "selected" : "";
-        return `<button type="button" class="tile ${selected}" data-answer-index="${index}" aria-label="Letter ${index + 1} of ${totalLetters}">${escapeHtml(shown)}</button>`;
-      } else {
-        const lockClass = locked ? "revealed" : "";
-        const finalShown = isSolved ? letter : shown;
-        return `<input type="text" maxlength="1" class="tile ${lockClass}" data-answer-index="${index}" aria-label="Letter ${index + 1} of ${totalLetters}" value="${escapeHtml(finalShown)}" ${locked ? 'readonly tabindex="-1"' : ''}>`;
-      }
-    }).join("");
+        if (isCreateMode) {
+          const selected = index === data.selectedAnswerIndex ? "selected" : "";
+          return `<button type="button" class="tile ${selected}" data-answer-index="${index}" aria-label="Letter ${index + 1} of ${totalLetters}">${escapeHtml(shown)}</button>`;
+        } else {
+          const lockClass = locked ? "revealed" : "";
+          const finalShown = isSolved ? letter : shown;
+          return `<input type="text" maxlength="1" class="tile ${lockClass}" data-answer-index="${index}" aria-label="Letter ${index + 1} of ${totalLetters}" value="${escapeHtml(finalShown)}" ${locked ? 'readonly tabindex="-1"' : ''}>`;
+        }
+      }).join("");
+      return `<span class="answer-group">${tiles}</span>`;
+    }).join('<span class="answer-gap" aria-hidden="true"></span>');
+
+    container.innerHTML = groupHtml;
   }
 
   function renderParCircles(root, data, container, label) {
@@ -1405,15 +1444,15 @@
   }
 
   function buildSharePayload(draft) {
-    const expiresAt = new Date(Date.now() + SHARE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
     return {
+      id: draft.shareId || null,
       date: draft.date,
-      expiresAt,
       author: draft.author,
       clue: draft.clue.trim(),
       answer: draft.answer,
       hints: draft.hints,
       par: draft.par,
+      editKey: draft.editKey || null,
     };
   }
 
@@ -1422,7 +1461,8 @@
   //  - POST /p       -> create puzzle, returns { id }
   //  - GET  /p/:id    -> fetch puzzle JSON
   async function uploadSharedPayload(payload) {
-    const url = `${WORKER_HOST.replace(/\/$/, "")}/p`;
+    const base = WORKER_HOST.replace(/\/$/, "");
+    const url = payload.editKey ? `${base}/p/${encodeURIComponent(payload.id)}` : `${base}/p`;
     const bodyText = JSON.stringify(payload);
     // Client-side safeguard: don't try to upload extremely large payloads
     const MAX_BODY = 200 * 1024; // 200KB
@@ -1431,7 +1471,7 @@
     }
 
     const response = await fetch(url, {
-      method: "POST",
+      method: payload.editKey ? "PUT" : "POST",
       headers: { "Content-Type": "application/json" },
       body: bodyText,
     });
@@ -1442,14 +1482,18 @@
     }
 
     const data = await response.json();
-    if (!data || !data.id) throw new Error("Unexpected response from worker");
-    return data.id;
+    if (!data || !data.id || !data.editKey) throw new Error("Unexpected response from worker");
+    return data;
   }
 
   async function buildAndUploadShareUrl(draft) {
-    const fileId = await uploadSharedPayload(buildSharePayload(draft));
+    const payload = buildSharePayload(draft);
+    const result = await uploadSharedPayload(payload);
+    draft.shareId = result.id;
+    draft.editKey = result.editKey;
+    saveDraftRecord(result.id, result.editKey);
     const url = new URL(window.location.href);
-    url.search = `?p=${encodeURIComponent(fileId)}`;
+    url.search = `?p=${encodeURIComponent(result.id)}`;
     url.hash = "";
     return url.toString();
   }
@@ -1500,6 +1544,41 @@
         </div>
       </div>
     `;
+  }
+
+  function getStoredDraftRecords() {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function saveDraftRecord(id, editKey) {
+    if (!id || !editKey) {
+      return;
+    }
+
+    const records = getStoredDraftRecords();
+    const next = [
+      { id, editKey, updatedAt: new Date().toISOString() },
+      ...records.filter((entry) => entry.id !== id),
+    ];
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next.slice(0, 25)));
+    } catch (error) {
+      // Ignore storage quota failures.
+    }
+  }
+
+  function getAnswerWordLengths(answer) {
+    return getWordLengths(answer);
+  }
+
+  function getWordLengths(text) {
+    return tokenizeClue(text).map((word) => word.length);
   }
 
   function renderLoadError(root) {
