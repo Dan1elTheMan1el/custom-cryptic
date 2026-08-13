@@ -17,8 +17,10 @@
   const WORKER_HOST = window.CUSTOM_CRYPTIC_WORKER_HOST || "https://custom-cryptic.friedmandaniel111.workers.dev";
   const SHARE_RETENTION_DAYS = 365; // 0x0.st's stated maximum retention
   const STORAGE_KEY = "custom-cryptic-drafts";
+  const COMPLETED_STORAGE_KEY = "custom-cryptic-completed";
 
   const params = new URLSearchParams(window.location.search);
+  const view = params.get("view");
   const fileId = params.get("p");
   const legacyPayload = fileId ? null : decodeSharedPayload(params.get("c"));
 
@@ -30,7 +32,9 @@
   document.body.style.margin = "0";
   document.body.appendChild(shell);
 
-  if (fileId) {
+  if (view === "library") {
+    renderLibraryMode(shell, params.get("q") || "", params.get("cursor") || "");
+  } else if (fileId) {
     renderLoadingState(shell);
     (async () => {
       try {
@@ -38,7 +42,7 @@
         console.log('Loaded puzzle payload:', payload);
         // Replace loading UI with the worker-provided styles, then render
         shell.innerHTML = buildStyles();
-        renderPlayMode(shell, normalizePayload(payload));
+        renderPlayMode(shell, normalizePayload({ ...payload, id: payload.id || fileId }));
       } catch (err) {
         console.error('Failed to load puzzle:', err);
         renderLoadError(shell);
@@ -89,6 +93,7 @@
 
     return {
       mode: "play",
+      puzzleId: payload?.id || null,
       date: payload?.date || DEFAULT_DATE,
       author: payload?.author || DEFAULT_AUTHOR,
       clue,
@@ -205,6 +210,25 @@
           box-shadow: 4px 4px 0 rgba(17, 17, 17, 0.18);
           color: #111111;
           text-decoration: none;
+        }
+
+        #custom-cryptic-editor-shell .nav-link {
+          height: 58px;
+          border: 4px solid #111111;
+          border-radius: 14px;
+          background: #ffffff;
+          color: #111111;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 10px 14px;
+          font: 800 12px/1.1 "SF Pro Text", "Segoe UI", sans-serif;
+          text-decoration: none;
+          box-shadow: 4px 4px 0 rgba(17, 17, 17, 0.18);
+        }
+
+        #custom-cryptic-editor-shell .nav-link.library-link {
+          background: #fff8dc;
         }
 
         #custom-cryptic-editor-shell .content {
@@ -740,6 +764,7 @@
             </div>
           </div>
           <div class="topbar-right">
+            <a class="nav-link library-link" href="?view=library" aria-label="Open library">Library</a>
             <a class="github-link" href="https://github.com/Dan1elTheMan1el" target="_blank" rel="noreferrer" aria-label="GitHub profile">
               <svg width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M12 2C6.48 2 2 6.58 2 12.25C2 16.78 4.865 20.61 8.84 21.97C9.34 22.06 9.52 21.75 9.52 21.49C9.52 21.26 9.51 20.54 9.51 19.69C6.73 20.31 6.14 18.47 6.14 18.47C5.69 17.28 5.04 16.97 5.04 16.97C4.13 16.33 5.11 16.34 5.11 16.34C6.12 16.42 6.65 17.41 6.65 17.41C7.54 18.98 8.99 18.53 9.57 18.28C9.66 17.62 9.92 17.17 10.21 16.92C7.99 16.66 5.66 15.77 5.66 11.84C5.66 10.72 6.05 9.81 6.7 9.1C6.59 8.84 6.24 7.82 6.8 6.44C6.8 6.44 7.63 6.17 9.5 7.48C10.28 7.26 11.11 7.15 11.94 7.15C12.77 7.15 13.6 7.26 14.38 7.48C16.25 6.17 17.08 6.44 17.08 6.44C17.64 7.82 17.29 8.84 17.18 9.1C17.84 9.81 18.22 10.72 18.22 11.84C18.22 15.79 15.88 16.65 13.65 16.91C14.01 17.22 14.34 17.83 14.34 18.76C14.34 20.1 14.33 21.18 14.33 21.49C14.33 21.75 14.51 22.07 15.02 21.97C18.99 20.61 21.85 16.78 21.85 12.25C21.85 6.58 17.52 2 12 2Z" fill="currentColor"></path>
@@ -915,6 +940,7 @@
             <div class="author-row"><span class="author-prefix">By</span><span style="font: 600 15px/1.2 'SF Pro Text', 'Segoe UI', sans-serif;">${escapeHtml(playState.author)}</span></div>
           </div>
           <div class="topbar-right">
+            <a class="nav-link library-link" href="?view=library" aria-label="Open library">Library</a>
             <a class="github-link" href="https://dan1eltheman1el.github.io/custom-cryptic" rel="noreferrer" aria-label="Create your own puzzle" title="Create your own puzzle" style="width: 58px; height: 58px; margin-right: 8px; background: #fff2a8; text-decoration: none; font: 700 12px/1.1 'SF Pro Text', 'Segoe UI', sans-serif; text-align: center; padding: 8px; display: inline-flex; align-items: center; justify-content: center;">Create</a>
             <a class="github-link" href="https://github.com/Dan1elTheMan1el" target="_blank" rel="noreferrer" aria-label="GitHub profile">
               <svg width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -1103,6 +1129,7 @@
 
       if (normalizedGuess === normalizedAnswer && normalizedGuess.length === normalizedAnswer.length) {
         playState.solved = true;
+        markPuzzleCompleted(playState.puzzleId || fileId || "");
         guessButton.classList.remove("wrong");
         guessButton.classList.add("right");
       } else {
@@ -1118,6 +1145,153 @@
     });
 
     render();
+  }
+
+  function renderLibraryMode(root, initialQuery, initialCursor) {
+    root.innerHTML += `
+      <div class="page">
+        <div class="topbar">
+          <div class="topbar-left" style="gap: 3px;">
+            <div class="date">Puzzle Library</div>
+            <div class="expiry-date">Search by clue or author</div>
+          </div>
+          <div class="topbar-right">
+            <a class="nav-link library-link" href="https://dan1eltheman1el.github.io/custom-cryptic" aria-label="Create a puzzle">Create</a>
+            <a class="github-link" href="https://github.com/Dan1elTheMan1el" target="_blank" rel="noreferrer" aria-label="GitHub profile">
+              <svg width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M12 2C6.48 2 2 6.58 2 12.25C2 16.78 4.865 20.61 8.84 21.97C9.34 22.06 9.52 21.75 9.52 21.49C9.52 21.26 9.51 20.54 9.51 19.69C6.73 20.31 6.14 18.47 6.14 18.47C5.69 17.28 5.04 16.97 5.04 16.97C4.13 16.33 5.11 16.34 5.11 16.34C6.12 16.42 6.65 17.41 6.65 17.41C7.54 18.98 8.99 18.53 9.57 18.28C9.66 17.62 9.92 17.17 10.21 16.92C7.99 16.66 5.66 15.77 5.66 11.84C5.66 10.72 6.05 9.81 6.7 9.1C6.59 8.84 6.24 7.82 6.8 6.44C6.8 6.44 7.63 6.17 9.5 7.48C10.28 7.26 11.11 7.15 11.94 7.15C12.77 7.15 13.6 7.26 14.38 7.48C16.25 6.17 17.08 6.44 17.08 6.44C17.64 7.82 17.29 8.84 17.18 9.1C17.84 9.81 18.22 10.72 18.22 11.84C18.22 15.79 15.88 16.65 13.65 16.91C14.01 17.22 14.34 17.83 14.34 18.76C14.34 20.1 14.33 21.18 14.33 21.49C14.33 21.75 14.51 22.07 15.02 21.97C18.99 20.61 21.85 16.78 21.85 12.25C21.85 6.58 17.52 2 12 2Z" fill="currentColor"></path>
+              </svg>
+            </a>
+          </div>
+        </div>
+
+        <section class="card clue-card" style="padding:20px 20px 16px;">
+          <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between;">
+            <input id="library-search" class="answer-input" type="search" placeholder="Search puzzles by clue or author" value="${escapeHtml(initialQuery)}" style="flex:1 1 320px;text-align:left;">
+            <div class="count-pill" id="library-count">Loading…</div>
+          </div>
+        </section>
+
+        <section class="card answer-card" style="padding:20px;">
+          <div id="library-list" style="display:grid;gap:12px;"></div>
+          <div style="display:flex;gap:12px;justify-content:space-between;align-items:center;margin-top:18px;flex-wrap:wrap;">
+            <button class="share-button" id="library-prev" type="button" disabled>Previous</button>
+            <button class="share-button" id="library-next" type="button" disabled>Next</button>
+          </div>
+        </section>
+      </div>
+    `;
+
+    const searchInput = root.querySelector("#library-search");
+    const listEl = root.querySelector("#library-list");
+    const countEl = root.querySelector("#library-count");
+    const prevButton = root.querySelector("#library-prev");
+    const nextButton = root.querySelector("#library-next");
+
+    const state = {
+      query: initialQuery,
+      cursor: initialCursor,
+      nextCursor: "",
+      cursorStack: [],
+      loading: false,
+      items: [],
+      error: "",
+    };
+
+    const completedIds = getCompletedPuzzleIds();
+
+    const updateUrl = () => {
+      const url = new URL(window.location.href);
+      url.searchParams.set("view", "library");
+      if (state.query) {
+        url.searchParams.set("q", state.query);
+      } else {
+        url.searchParams.delete("q");
+      }
+      if (state.cursor) {
+        url.searchParams.set("cursor", state.cursor);
+      } else {
+        url.searchParams.delete("cursor");
+      }
+      window.history.replaceState(null, "", url.toString());
+    };
+
+    const render = () => {
+      countEl.textContent = state.loading ? "Loading…" : `${state.items.length} result${state.items.length === 1 ? "" : "s"}`;
+      if (state.error) {
+        listEl.innerHTML = `<div style="font:600 15px/1.5 'SF Pro Text','Segoe UI',sans-serif;color:rgba(17,17,17,0.72);padding:18px 4px;">${escapeHtml(state.error)}</div>`;
+      } else {
+        listEl.innerHTML = state.items.length
+          ? state.items.map((item) => {
+            const completed = completedIds.includes(item.id) ? '<span class="count-pill" style="padding:4px 8px;font-size:12px;background:#c7f5c7;">Completed</span>' : '';
+            const dateText = item.date || item.updatedAt || '';
+            return `
+            <a href="?p=${encodeURIComponent(item.id)}" style="text-decoration:none;color:inherit;display:block;">
+              <article class="panel-card" style="padding:16px 16px 14px;background:#fffdf4;">
+                <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
+                  <div style="display:grid;gap:6px;min-width:0;">
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                      <strong style="font:800 16px/1.2 'SF Pro Text','Segoe UI',sans-serif;">${escapeHtml(item.author || 'Anonymous')}</strong>
+                        ${dateText ? `<span style="font:600 13px/1.2 'SF Pro Text','Segoe UI',sans-serif;color:rgba(17,17,17,0.62);">${escapeHtml(dateText)}</span>` : ''}
+                      <span class="count-pill" style="padding:4px 8px;font-size:12px;">Par ${escapeHtml(String(item.par || 0))}</span>
+                      ${completed}
+                    </div>
+                    <div style="font:600 15px/1.4 'SF Pro Text','Segoe UI',sans-serif;color:rgba(17,17,17,0.8);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;">${escapeHtml(item.clue || '')}</div>
+                  </div>
+                </div>
+              </article>
+            </a>
+          `;
+          }).join("")
+          : `<div style="font:600 15px/1.5 'SF Pro Text','Segoe UI',sans-serif;color:rgba(17,17,17,0.72);padding:18px 4px;">No puzzles found.</div>`;
+      }
+      prevButton.disabled = state.cursorStack.length === 0 || state.loading;
+      nextButton.disabled = !state.nextCursor || state.loading;
+      updateUrl();
+    };
+
+    const loadPage = async () => {
+      state.loading = true;
+      render();
+      try {
+        state.error = "";
+        const data = await fetchLibraryPage(state.query, state.cursor);
+        state.items = data.items || [];
+        state.nextCursor = data.cursor || "";
+      } catch (error) {
+        state.items = [];
+        state.nextCursor = "";
+        state.error = error && error.message ? error.message : "Couldn't load library";
+      } finally {
+        state.loading = false;
+        render();
+      }
+    };
+
+    let searchTimer = null;
+    searchInput.addEventListener("input", () => {
+      state.query = searchInput.value.trim();
+      state.cursor = "";
+      state.nextCursor = "";
+      state.cursorStack = [];
+      window.clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(() => loadPage(), 250);
+    });
+
+    prevButton.addEventListener("click", () => {
+      if (!state.cursorStack.length) return;
+      state.cursor = state.cursorStack.pop() || "";
+      loadPage();
+    });
+
+    nextButton.addEventListener("click", () => {
+      if (!state.nextCursor) return;
+      state.cursorStack.push(state.cursor);
+      state.cursor = state.nextCursor;
+      loadPage();
+    });
+
+    loadPage();
   }
 
   function renderHintEditorList(root, draft, hintList, onChange) {
@@ -1571,6 +1745,49 @@
     } catch (error) {
       // Ignore storage quota failures.
     }
+  }
+
+  function getCompletedPuzzleIds() {
+    try {
+      const raw = window.localStorage.getItem(COMPLETED_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function markPuzzleCompleted(id) {
+    if (!id) {
+      return;
+    }
+
+    const ids = new Set(getCompletedPuzzleIds());
+    ids.add(id);
+
+    try {
+      window.localStorage.setItem(COMPLETED_STORAGE_KEY, JSON.stringify(Array.from(ids).slice(0, 1000)));
+    } catch (error) {
+      // Ignore storage quota failures.
+    }
+  }
+
+  async function fetchLibraryPage(query, cursor) {
+    const url = new URL(`${WORKER_HOST.replace(/\/$/, "")}/library`);
+    if (query) {
+      url.searchParams.set("q", query);
+    }
+    if (cursor) {
+      url.searchParams.set("cursor", cursor);
+    }
+    url.searchParams.set("limit", "18");
+
+    const response = await fetch(url.toString(), { method: "GET" });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`Library fetch failed (${response.status}) ${text}`);
+    }
+    return response.json();
   }
 
   function getAnswerWordLengths(answer) {

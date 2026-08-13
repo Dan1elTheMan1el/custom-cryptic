@@ -27,6 +27,7 @@ const MAX_HINTS = 12;
 const MAX_HINT_LENGTH = 1000;
 const MAX_UPLOADS_PER_IP_PER_DAY = 30;
 const DEFAULT_RETENTION_DAYS = 365;
+const EDIT_KEY_TTL_SECONDS = 24 * 60 * 60;
 
 // Allow CORS from anywhere by default; you can change this to restrict origins.
 const CORS_HEADERS = {
@@ -64,7 +65,14 @@ async function handleRequest(request, event) {
             const stored = await loadPuzzleRecord(id);
             if (!stored) return jsonResponse({ error: 'Not found' }, 404);
             const parsed = JSON.parse(stored);
-            return jsonResponse(stripStorageFields(parsed));
+            return jsonResponse(stripStorageFields(parsed, id));
+        }
+
+        if (request.method === 'GET' && parts[0] === 'library') {
+            const query = normalizeSearchQuery(url.searchParams.get('q') || '');
+            const cursor = url.searchParams.get('cursor') || undefined;
+            const limit = clampInteger(Number(url.searchParams.get('limit') || 18), 1, 50);
+            return jsonResponse(await listLibrarySummaries({ query, cursor, limit }));
         }
 
         if ((request.method === 'POST' || request.method === 'PUT') && parts[0] === 'p') {
@@ -115,17 +123,19 @@ async function handleRequest(request, event) {
                 return jsonResponse({ error: 'HTML or embedded content not allowed' }, 400);
             }
 
-            // Rate-limit per IP per day (simple counter stored in KV with 24h TTL)
+            const isUpdate = request.method === 'PUT';
             const ip = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'anon';
             const dayKey = `ip:${ip}:${(new Date()).toISOString().slice(0, 10)}`; // YYYY-MM-DD
-            const ipCountRaw = await globalThis.PUZZLES.get(dayKey);
-            const ipCount = ipCountRaw ? Number(ipCountRaw) : 0;
-            if (ipCount >= MAX_UPLOADS_PER_IP_PER_DAY) {
-                return jsonResponse({ error: 'Upload quota exceeded for this IP today' }, 429);
+            let ipCount = 0;
+            if (!isUpdate) {
+                const ipCountRaw = await globalThis.PUZZLES.get(dayKey);
+                ipCount = ipCountRaw ? Number(ipCountRaw) : 0;
+                if (ipCount >= MAX_UPLOADS_PER_IP_PER_DAY) {
+                    return jsonResponse({ error: 'Upload quota exceeded for this IP today' }, 429);
+                }
             }
 
-            const isUpdate = request.method === 'PUT';
-            const id = isUpdate ? parts[1] : generateId();
+            const id = isUpdate ? parts[1] : await generateUniquePuzzleId();
             const existing = isUpdate ? await loadPuzzleRecord(id) : null;
             const existingRecord = existing ? JSON.parse(existing) : null;
 
@@ -136,23 +146,37 @@ async function handleRequest(request, event) {
                 }
             }
 
-            const editKey = isUpdate && existingRecord && existingRecord.editKey ? existingRecord.editKey : generateId(16);
+            const editKey = isUpdate && existingRecord && existingRecord.editKey ? existingRecord.editKey : await generateUniqueEditKey();
 
             const ttlSeconds = DEFAULT_RETENTION_DAYS * 24 * 60 * 60;
+            const nowIso = new Date().toISOString();
+            const updatedAt = nowIso;
+            const createdAt = existingRecord && existingRecord.createdAt ? existingRecord.createdAt : nowIso;
+            const previousLibraryKey = existingRecord && existingRecord.libraryKey ? existingRecord.libraryKey : (existingRecord && existingRecord.updatedAt ? libraryKey(existingRecord.updatedAt, id) : null);
+            const nextLibraryKey = libraryKey(updatedAt, id);
 
             const storedPayload = {
-                date: payload.date || new Date().toISOString(),
+                date: payload.date || createdAt,
+                createdAt,
+                updatedAt,
                 author: author || '',
                 clue,
                 answer,
                 hints: hints.map(h => ({ id: h.id || null, text: String(h.text || ''), type: (h && h.type) || 'indicator', words: Array.isArray(h && h.words) ? h.words.map(Number).filter(Number.isInteger) : [] })),
                 par: Number.isInteger(payload.par) ? payload.par : 0,
                 editKey,
-                updatedAt: new Date().toISOString(),
+                libraryKey: nextLibraryKey,
             };
 
             await globalThis.PUZZLES.put(recordKey(id), JSON.stringify(storedPayload), { expirationTtl: ttlSeconds });
-            await globalThis.PUZZLES.put(editRecordKey(editKey), id, { expirationTtl: ttlSeconds });
+            await globalThis.PUZZLES.put(editRecordKey(editKey), id, { expirationTtl: EDIT_KEY_TTL_SECONDS });
+            await globalThis.PUZZLES.put(nextLibraryKey, '', {
+                expirationTtl: ttlSeconds,
+                metadata: libraryMetadata(id, author, clue, payload.par, updatedAt, storedPayload.date),
+            });
+            if (previousLibraryKey && previousLibraryKey !== nextLibraryKey) {
+                await globalThis.PUZZLES.delete(previousLibraryKey);
+            }
 
             if (globalThis.WEBHOOK_URL && !isUpdate) {
                 const notification = sendDiscordPublicationNotification(request, id, storedPayload);
@@ -163,10 +187,10 @@ async function handleRequest(request, event) {
                 }
             }
 
-            // increment ip counter
-            const newCount = ipCount + 1;
-            // store with 24h TTL
-            await globalThis.PUZZLES.put(dayKey, String(newCount), { expirationTtl: 24 * 60 * 60 });
+            if (!isUpdate) {
+                const newCount = ipCount + 1;
+                await globalThis.PUZZLES.put(dayKey, String(newCount), { expirationTtl: 24 * 60 * 60 });
+            }
 
             return jsonResponse({ id, editKey }, isUpdate ? 200 : 201);
         }
@@ -186,6 +210,23 @@ function editRecordKey(editKey) {
     return `edit:${editKey}`;
 }
 
+function libraryKey(updatedAt, id) {
+    const reverse = String(9999999999999 - Date.parse(updatedAt)).padStart(13, '0');
+    return `library:${reverse}:${id}`;
+}
+
+function libraryMetadata(id, author, clue, par, updatedAt, date) {
+    return {
+        id,
+        author: String(author || ''),
+        clue: String(clue || ''),
+        par: Number.isInteger(par) ? par : 0,
+        updatedAt,
+        date: date || updatedAt,
+        searchText: normalizeSearchBlob(author, clue),
+    };
+}
+
 async function loadPuzzleRecord(id) {
     const modern = await globalThis.PUZZLES.get(recordKey(id));
     if (modern) {
@@ -195,9 +236,12 @@ async function loadPuzzleRecord(id) {
     return globalThis.PUZZLES.get(id);
 }
 
-function stripStorageFields(payload) {
+function stripStorageFields(payload, id) {
     return {
+        id: payload.id || id || null,
         date: payload.date,
+        createdAt: payload.createdAt,
+        updatedAt: payload.updatedAt,
         author: payload.author,
         clue: payload.clue,
         answer: payload.answer,
@@ -212,6 +256,89 @@ function generateId(length = 10) {
     let s = '';
     for (let i = 0; i < length; i++) s += alphabet[Math.floor(Math.random() * alphabet.length)];
     return s;
+}
+
+async function generateUniquePuzzleId() {
+    for (let attempt = 0; attempt < 30; attempt++) {
+        const id = generateId(10);
+        if (!(await loadPuzzleRecord(id))) {
+            return id;
+        }
+    }
+
+    throw new Error('Unable to generate unique puzzle id');
+}
+
+async function generateUniqueEditKey() {
+    for (let attempt = 0; attempt < 30; attempt++) {
+        const editKey = generateId(16);
+        if (!(await globalThis.PUZZLES.get(editRecordKey(editKey)))) {
+            return editKey;
+        }
+    }
+
+    throw new Error('Unable to generate unique edit key');
+}
+
+function clampInteger(value, min, max) {
+    const numeric = Number.isFinite(value) ? Math.trunc(value) : min;
+    return Math.max(min, Math.min(max, numeric));
+}
+
+function normalizeSearchQuery(value) {
+    return String(value || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function normalizeSearchBlob(author, clue) {
+    return normalizeSearchQuery(`${author || ''} ${clue || ''}`);
+}
+
+async function listLibrarySummaries({ query, cursor, limit }) {
+    const terms = query ? query.split(' ') : [];
+    const items = [];
+    let nextCursor = cursor;
+    let exhausted = false;
+
+    while (items.length < limit && !exhausted) {
+        const listing = await globalThis.PUZZLES.list({
+            prefix: 'library:',
+            cursor: nextCursor,
+            limit: terms.length ? 1000 : limit,
+        });
+
+        for (const entry of listing.keys) {
+            const metadata = entry.metadata || {};
+            const searchText = String(metadata.searchText || '');
+            if (!terms.length || terms.every((term) => searchText.includes(term))) {
+                items.push({
+                    id: metadata.id || entry.name.split(':').pop(),
+                    author: metadata.author || '',
+                    clue: metadata.clue || '',
+                    par: Number.isInteger(metadata.par) ? metadata.par : 0,
+                    date: metadata.date || metadata.updatedAt || null,
+                    updatedAt: metadata.updatedAt || null,
+                });
+                if (items.length >= limit) {
+                    break;
+                }
+            }
+        }
+
+        nextCursor = listing.cursor || '';
+        exhausted = !listing.cursor || !nextCursor;
+        if (!terms.length) {
+            break;
+        }
+    }
+
+    return {
+        items,
+        cursor: nextCursor || null,
+    };
 }
 
 function sendDiscordPublicationNotification(request, id, puzzle) {
